@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: runoob-flask-test
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
