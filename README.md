@@ -2,6 +2,9 @@
 
 一个用 Flask + SQLite 实现的任务条目接口服务，提供列表、新增、修改、删除四个接口，数据保存在本地数据库文件中，重启服务后不丢失。配套前端是 `wangye` 仓库里的今日待办页面。
 
+- 仓库：https://github.com/a-sun-moon-stars/runoob-flask-test
+- 线上接口：https://sunmoonstars.pythonanywhere.com/api/items
+
 ## 技术栈
 
 - Python 3.10+（本机 3.15）
