@@ -29,6 +29,22 @@ python app.py
 
 服务监听 `http://127.0.0.1:5000`，首次启动自动创建 `app.db` 和 `items` 表，按 `Ctrl+C` 停止。端口被占用时先 `netstat -ano | findstr :5000` 查 PID，再 `taskkill /F /PID <PID>`。
 
+## 对话页配置（任务四）
+
+复制 `.env.example` 为 `.env`，填自己的 Key：
+
+```text
+DEEPSEEK_API_KEY=sk-xxxxxxxx
+DEEPSEEK_MODEL=deepseek-chat
+```
+
+`app.py` 启动时读同目录的 `.env`，已存在的环境变量优先；`.env` 已写进 `.gitignore`，不会进仓库。服务器（PythonAnywhere）上同样把 `.env` 放在 `app.py` 同目录即可，或在 WSGI 文件里设置 `os.environ["DEEPSEEK_API_KEY"]`。
+
+```bash
+curl -N -X POST http://127.0.0.1:5000/api/chat -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"今天先做哪件？"}]}'
+```
+
 ## 接口约定
 
 所有接口返回统一结构：
@@ -49,6 +65,16 @@ python app.py
 | DELETE | `/api/items/<id>` | path：`id` 整数 | `{"code":0,"data":{"id":1},"msg":"删除成功"}` |
 
 附加字段统一存进 `items.extra`（JSON 文本），GET 时展开合并到返回对象里。
+
+### 对话接口（流式）
+
+| 方法 | 路径 | 参数 | 返回 |
+| --- | --- | --- | --- |
+| POST | `/api/chat` | body：`messages` 数组，`role` 为 `user`/`assistant`，`content` 非空且 ≤ 4000 字符，最后一条必须是 `user`，最多 20 条 | `text/event-stream`：`data: {"delta":"..."}` 逐字返回，`data: [DONE]` 结束；失败时 `event: error` + `{"msg":"..."}` |
+
+- Key 只从服务端环境变量 `DEEPSEEK_API_KEY` 读取，前端 JS 里没有 Key；系统提示词在服务端拼，不接受前端传入。
+- 上下文超过 6000 字符时从最早的消息开始丢，至少保留最后一轮。
+- `401` Key 无效、`402` 余额不足、`403` 无权限、`429` 限流、超时、连不上，都会通过 `event: error` 返回可读中文，服务不中断。
 
 ### 参数校验
 

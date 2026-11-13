@@ -2,9 +2,11 @@ import json
 import os
 import re
 import sqlite3
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 
-from flask import Flask, g, jsonify, request
+from flask import Flask, Response, g, jsonify, request, stream_with_context
 from werkzeug.exceptions import HTTPException
 
 app = Flask(__name__)
@@ -13,12 +15,39 @@ app.json.sort_keys = False      # 保持 code / data / msg 的书写顺序
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app.db")
 
+
+def load_dotenv(path):
+    """读同目录下的 .env（KEY=VALUE 一行一条），已存在的环境变量优先。"""
+    if not os.path.exists(path):
+        return
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+
 # 任务条目的可选扩展字段：前端清单页用得到，但都不是必填。
 TEXT_FIELDS = {"summary": 200, "tag": 20, "priority": 20, "note": 2000}
 ALLOWED_TAGS = {"学习", "项目", "生活", "复盘"}
 ALLOWED_PRIORITIES = {"high", "medium", "low"}
 DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 TIME_PATTERN = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+
+# ---------------- 对话页配置：Key 只从服务器环境变量读，前端拿不到 ----------------
+DEEPSEEK_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1/chat/completions")
+CHAT_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
+MAX_CONTEXT_CHARS = 6000   # 上下文总长度上限，超了从最早的消息开始丢
+SYSTEM_PROMPT = (
+    "你是「今日待办」页面里的助手，帮用户把今天要做的事理清楚。"
+    "只讨论任务整理、优先级、时间安排这类话题；和待办无关的问题，简短说明你帮不上。"
+    "回答用简体中文，口语化，不超过 200 字；需要列步骤时最多 5 条。"
+    "不知道的信息不要编，直接说不确定。"
+)
 
 
 # ---------------- 数据库 ----------------
@@ -179,6 +208,7 @@ def add_cors_headers(response):
 
 @app.route("/api/items", methods=["OPTIONS"])
 @app.route("/api/items/<int:item_id>", methods=["OPTIONS"])
+@app.route("/api/chat", methods=["OPTIONS"])
 def cors_preflight(item_id=None):
     # 浏览器发预检时，这里只回 200 和响应头，after_request 会补全 CORS。
     return ("", 204)
@@ -265,6 +295,136 @@ def delete_item(item_id):
     db.execute("DELETE FROM items WHERE id = ?", (item_id,))
     db.commit()
     return ok({"id": item_id}, "删除成功")
+
+
+# ---------------- 对话接口：流式转发，Key 只留在服务端 ----------------
+def sse_error(msg):
+    return "event: error\ndata: " + json.dumps({"msg": msg}, ensure_ascii=False) + "\n\n"
+
+
+def read_chat_messages(payload):
+    if not isinstance(payload, dict):
+        return None, "请求体必须是 JSON 对象"
+    messages = payload.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return None, "messages 必须是非空数组"
+    if len(messages) > 20:
+        return None, "最多允许 20 条消息"
+    cleaned = []
+    for item in messages:
+        if not isinstance(item, dict):
+            return None, "messages 里的每一项都必须是对象"
+        role = item.get("role")
+        content = item.get("content")
+        if role not in ("user", "assistant"):
+            return None, "role 只能是 user 或 assistant"
+        if not isinstance(content, str) or not content.strip():
+            return None, "content 必须是非空字符串"
+        if len(content) > 4000:
+            return None, "单条消息不能超过 4000 个字符"
+        cleaned.append({"role": role, "content": content.strip()})
+    if cleaned[-1]["role"] != "user":
+        return None, "最后一条消息必须是 user"
+    return cleaned, None
+
+
+def trim_messages(messages):
+    """上下文超长就从最早的一条开始丢，至少保留最后一轮。"""
+    total = sum(len(m["content"]) for m in messages)
+    while total > MAX_CONTEXT_CHARS and len(messages) > 2:
+        removed = messages.pop(0)
+        total -= len(removed["content"])
+    return messages
+
+
+def upstream_error_message(status):
+    if status == 401:
+        return "API Key 无效或已过期，请检查服务器环境变量 DEEPSEEK_API_KEY"
+    if status == 402:
+        return "账户余额不足，请到开放平台充值后再试"
+    if status == 403:
+        return "没有访问该模型的权限"
+    if status == 429:
+        return "请求太频繁，被限流了，等几秒再试"
+    if status >= 500:
+        return "模型服务暂时不可用，稍后再试"
+    return "模型调用失败（HTTP " + str(status) + "）"
+
+
+def stream_chat(messages):
+    payload = {
+        "model": CHAT_MODEL,
+        "messages": [{"role": "system", "content": SYSTEM_PROMPT}] + messages,
+        "stream": True,
+        "temperature": 0.7,
+    }
+    req = urllib.request.Request(
+        DEEPSEEK_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": "Bearer " + os.environ.get("DEEPSEEK_API_KEY", "").strip(),
+            "Accept": "text/event-stream",
+        },
+        method="POST",
+    )
+    try:
+        resp = urllib.request.urlopen(req, timeout=60)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")
+        app.logger.warning("模型接口返回 %s: %s", exc.code, detail[:300])
+        yield sse_error(upstream_error_message(exc.code))
+        return
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, TimeoutError):
+            yield sse_error("模型响应超时，请重试")
+        else:
+            yield sse_error("连不上模型服务（" + str(exc.reason) + "），检查网络或 Base URL")
+        return
+    except TimeoutError:
+        yield sse_error("模型响应超时，请重试")
+        return
+    except Exception as exc:  # noqa: BLE001
+        app.logger.exception("模型调用异常")
+        yield sse_error("调用模型时出错：" + str(exc))
+        return
+
+    try:
+        with resp:
+            for raw in resp:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line or not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                    delta = chunk["choices"][0].get("delta", {}).get("content") or ""
+                except (ValueError, KeyError, IndexError):
+                    continue
+                if delta:
+                    yield "data: " + json.dumps({"delta": delta}, ensure_ascii=False) + "\n\n"
+    except Exception:  # noqa: BLE001
+        app.logger.exception("流式读取中断")
+        yield sse_error("模型响应中断或超时，请重试")
+        return
+
+    yield "data: [DONE]\n\n"
+
+
+@app.post("/api/chat")
+def chat():
+    if not os.environ.get("DEEPSEEK_API_KEY", "").strip():
+        return fail("服务端未配置 DEEPSEEK_API_KEY", 500, code=500)
+    messages, err = read_chat_messages(request.get_json(silent=True))
+    if err:
+        return fail(err)
+    messages = trim_messages(messages)
+    response = Response(stream_with_context(stream_chat(messages)), mimetype="text/event-stream")
+    response.headers["Cache-Control"] = "no-cache"
+    response.headers["X-Accel-Buffering"] = "no"
+    return response
 
 
 # ---------------- 全局错误处理：一律 JSON，不吐 HTML ----------------

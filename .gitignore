@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 *.db
 body.json
+.env
+.env.*
+!.env.example
+*.log
